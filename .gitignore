@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Virtualenv
+.env
+.env/
+.venv/
+venv/
+ENV/
+
+# VSCode
+.vscode/
+*.code-workspace
+
+# Projektin data ja lokit
+data/*.csv
+data/*.xlsx
+logs/*.csv
+
+# Jätä esimerkkitiedostot kuitenkin mukaan
+!data/.gitkeep
+!.env_example
+
+# Käyttöjärjestelmän roskatiedostot
+.DS_Store
+Thumbs.db
+
+# PyCharm
+.idea/
+
+# Testitulosteet
+*.log
