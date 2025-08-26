@@ -8,26 +8,49 @@ All scripts use a HubSpot **Private App token** stored securely in a `.env` file
 ## 📦 Scripts Overview
 
 ### 1. `company_duplicates.py`
-Purpose: **Detect and export duplicate companies by domain.**
+Purpose: **Detect and export duplicate companies using multiple strategies.**
 
 - Fetches all companies via the HubSpot API.  
-- Normalizes domains (lowercase, strip `www.`, punycode support).  
-- Groups companies by domain.  
-- Identifies groups where multiple companies share the same domain.  
+- Normalizes domains (lowercase, strip `www.`).  
+- Normalizes company names (case-folding, punctuation/whitespace cleanup, removing common suffixes like “Oy”, “Ltd”).  
+- Derives **contact-based domains**: if a company has associated contacts with emails like `user@acme.com`, the most common non-freemail domain (`acme.com`) is used as the company’s effective domain.  
+- Groups companies by:
+  - **Company domain** (property `domain`)  
+  - **Company name** (normalized)  
+  - **Contact-derived domain**  
+- Identifies groups where multiple companies share the same key.  
 - Writes all duplicate records to `data/duplicates_YYYYMMDD-HHMMSS.csv`.  
 
 Output CSV columns:
 ```
-id;domain;name
+id;domain;name;match_type;match_key
+```
+- `match_type` = `company_domain`, `company_name`, or `contact_domain`  
+- `match_key` = the actual domain or normalized name that matched  
+
+Usage examples:
+```bash
+# Default: run all rules (domain + name + contact domain)
+python company_duplicates.py
+
+# Disable contact-domain grouping
+python company_duplicates.py --no-by-contact-domain
+
+# Disable name grouping
+python company_duplicates.py --no-by-name
 ```
 
-Usage:
-```bash
-python company_duplicates.py
-```
+Console output also shows:
+- How many companies were fetched  
+- How many lacked a domain  
+- How many got a contact-derived domain  
+- Counts of groups and rows found for each match type  
+
 Result example:
 ```
-✅ Saved 145 rows to data/duplicates_20250822-134500.csv
+✅ Saved 732 rows to data/duplicates_20250825-101530.csv
+Groups found -> by_domain: 120 (rows 480), by_name: 35 (rows 140), contact_domain: 12 (rows 112)
+Note: contact_domain derived from associated contacts' emails (freemail domains ignored).
 ```
 
 ---
@@ -35,10 +58,10 @@ Result example:
 ### 2. `company_merge.py`
 Purpose: **Safely merge duplicate companies into a single “primary” record.**
 
-- Reads a semicolon-separated CSV (format: `id;domain;name`)  
+- Reads a semicolon-separated CSV (format: `id;domain;name;match_type;match_key`)  
 - Groups records by domain.  
 - Fetches metadata (`name`, `domain`, `hs_createdate`, `createdate`).  
-- Selects a **primary record** per domain:  
+- Selects a **primary record** per group:  
   - The oldest `createdate` if available, otherwise the numerically smallest ID.  
 - Resolves **canonical company IDs** (handles HubSpot’s alias / forward references).  
 - Merges duplicates into the chosen primary via HubSpot’s **merge endpoint**.  
@@ -107,10 +130,6 @@ venv\Scripts\activate      # Windows
 ```bash
 pip install -r requirements.txt
 ```
-Dependencies:
-- `requests`
-- `python-dotenv`
-- `idna` (optional, for robust domain normalization)
 
 4. **Configure environment**
 Create a `.env` file in the project root:
@@ -126,7 +145,7 @@ HUBSPOT_TOKEN=pat-xxxxxx-your-private-app-token
 
 ```
 .
-├── company_duplicates.py   # Detect duplicates by domain and export to CSV
+├── company_duplicates.py   # Detect duplicates by domain, name, and contact-derived domain
 ├── company_merge.py        # Merge duplicates into a single primary, with logging
 ├── company_test.py         # Connectivity test script
 ├── data/                   # Duplicate exports (gitignored, only .gitkeep committed)
