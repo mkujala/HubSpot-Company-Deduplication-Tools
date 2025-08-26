@@ -19,18 +19,18 @@ PAGE_LIMIT = 100
 BATCH_SIZE = 100
 MAX_RETRIES = 5
 
-# Yleiset freemail-domainit, joita ei käytetä yritysdomainin päätelyyn kontakteista
+# Common freemail domains to ignore when deriving org domains from contacts
 FREEMAIL = {
     "gmail.com", "outlook.com", "hotmail.com", "live.com", "yahoo.com", "icloud.com",
     "me.com", "msn.com", "aol.com", "proton.me", "protonmail.com", "mail.com", "gmx.com"
 }
 
-# ---------- apurit ----------
+# ---------- helpers ----------
 def load_token() -> str:
     load_dotenv()
     t = os.getenv("HUBSPOT_TOKEN")
     if not t:
-        raise RuntimeError("HUBSPOT_TOKEN missing (.env)")
+        raise RuntimeError("HUBSPOT_TOKEN missing from .env")
     return t
 
 def session_with_headers(token: str) -> requests.Session:
@@ -43,6 +43,10 @@ def session_with_headers(token: str) -> requests.Session:
     return s
 
 def request_with_retry(s: requests.Session, method: str, url: str, **kwargs) -> requests.Response:
+    """
+    HTTP request with retries for rate limiting / transient server errors.
+    Respects Retry-After when present.
+    """
     last = None
     for attempt in range(1, MAX_RETRIES + 1):
         r = s.request(method, url, timeout=30, **kwargs)
@@ -71,6 +75,7 @@ def norm_name(v: str | None) -> str:
     n = v.casefold().strip()
     n = re.sub(r"[\s\-_]+", " ", n)
     n = re.sub(r"[^\w\s]", "", n, flags=re.UNICODE)
+    # conservatively remove some common suffixes
     n = re.sub(r"\b(oy|ab|ltd|inc|oyj)\b\.?", "", n).strip()
     return n
 
@@ -79,9 +84,11 @@ def email_to_domain(email: str | None) -> str:
         return ""
     return norm_domain(email.split("@", 1)[1])
 
-# ---------- datahaku ----------
+# ---------- data fetching ----------
 def fetch_all_companies(s: requests.Session) -> list[dict]:
-    """Palauttaa dict-listan: {id, name, domain}"""
+    """
+    Returns a list of dicts: {id, name, domain}
+    """
     out = []
     params = {"limit": PAGE_LIMIT, "archived": "false", "properties": "name,domain"}
     after = None
@@ -106,8 +113,8 @@ def fetch_all_companies(s: requests.Session) -> list[dict]:
 
 def batch_read_associations_company_contacts(s: requests.Session, company_ids: list[str]) -> dict[str, list[str]]:
     """
-    Palauttaa {company_id: [contact_ids]} käyttäen associations batch readiä.
-    Käsittelee myös HTTP 207 (Multi-Status) – parsii onnistuneet rivit 'results':ista.
+    Returns {company_id: [contact_ids]} using associations batch read.
+    Handles HTTP 207 (Multi-Status) by parsing successes from 'results'.
     """
     out: dict[str, list[str]] = defaultdict(list)
     for i in range(0, len(company_ids), BATCH_SIZE):
@@ -124,13 +131,15 @@ def batch_read_associations_company_contacts(s: requests.Session, company_ids: l
             tos = [t.get("toObjectId") for t in row.get("to", []) if t.get("toObjectId")]
             if from_id and tos:
                 out[from_id].extend(tos)
-        # (valinnainen) virheiden lokitus:
-        # for err in (data.get("errors") or []):
-        #     print(f"Assoc warning: {err}")
+        # Optionally inspect per-item errors in data.get("errors")
+
     return out
 
 def batch_read_contacts_emails(s: requests.Session, contact_ids: list[str]) -> dict[str, str]:
-    """Palauttaa {contact_id: email} batch/readilla."""
+    """
+    Returns {contact_id: email} using contacts batch read.
+    Handles HTTP 207 similarly by reading 'results'.
+    """
     out: dict[str, str] = {}
     for i in range(0, len(contact_ids), BATCH_SIZE):
         chunk = contact_ids[i:i + BATCH_SIZE]
@@ -155,9 +164,9 @@ def derive_contact_domain_for_companies(
     only_ids_without_domain: set[str] | None = None
 ) -> dict[str, str]:
     """
-    Päättelee yritykselle kontaktien sähköpostiosoitteista yleisimmän (ei-freemail) domainin.
-    Käsittelee vain 'only_ids_without_domain' -joukon, jos annettu.
-    Palauttaa {company_id: contact_domain or ""}.
+    For each company, derive the most common non-freemail email domain from associated contacts.
+    If only_ids_without_domain is provided, compute only for that subset.
+    Returns {company_id: contact_domain or ""}.
     """
     target_ids = list(only_ids_without_domain) if only_ids_without_domain else company_ids
     if not target_ids:
@@ -181,12 +190,12 @@ def derive_contact_domain_for_companies(
             result[comp_id] = common
     return result
 
-# ---------- pääohjelma ----------
+# ---------- main ----------
 def main():
     ap = argparse.ArgumentParser(
-        description="Find HubSpot company duplicates by domain, normalized name, and contact email domains."
+        description="Find HubSpot company duplicates by domain, normalized name, and contact-derived email domains."
     )
-    # Kaikki säännöt päällä oletuksena; voi kytkeä pois lipuilla
+    # All strategies ON by default; can be disabled with flags
     ap.add_argument("--no-by-domain", action="store_true", help="Disable grouping by company domain.")
     ap.add_argument("--no-by-name", action="store_true", help="Disable grouping by normalized company name.")
     ap.add_argument("--no-by-contact-domain", action="store_true", help="Disable grouping by contact-derived domain.")
@@ -206,7 +215,7 @@ def main():
     print(f"Fetched {total} companies (without domain: {no_domain_count}).")
     print(f"Rules -> by_domain={use_by_domain}, by_name={use_by_name}, by_contact_domain={use_by_contact_domain}")
 
-    # Ryhmittely domainin ja nimen mukaan
+    # Grouping by domain and normalized name
     by_domain: dict[str, list[dict]] = defaultdict(list)
     by_name: dict[str, list[dict]] = defaultdict(list)
     all_company_ids: list[str] = []
@@ -220,7 +229,7 @@ def main():
             if nn:
                 by_name[nn].append(c)
 
-    # Kontaktidomainit vain niille, joilta domain puuttuu
+    # Contact-derived domains for companies missing a domain only
     by_contact_domain: dict[str, list[dict]] = defaultdict(list)
     contact_domains: dict[str, str] = {}
     derived_count = 0
@@ -237,6 +246,7 @@ def main():
                 by_contact_domain[cd].append(c)
         print(f"Derived contact-domain for {derived_count} companies (non-freemail).")
 
+    # Collect duplicate rows
     dup_rows = []
 
     def add_grouping(group_dict, label: str):
@@ -262,7 +272,7 @@ def main():
         print("No duplicates found with the selected criteria.")
         return
 
-    # Tulostus CSV:ksi
+    # Write CSV
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     os.makedirs("data", exist_ok=True)
     out_path = os.path.join("data", f"duplicates_{ts}.csv")
@@ -276,7 +286,7 @@ def main():
     print(f"Groups found -> by_domain: {g_dom} (rows {r_dom}), by_name: {g_name} (rows {r_name}), contact_domain: {g_cdom} (rows {r_cdom})")
     if use_by_contact_domain:
         print("Note: contact_domain derived from associated contacts' emails (freemail domains ignored).")
-        print("Required scopes: crm.objects.companies.read, crm.associations.read, crm.objects.contacts.read")
+        print("Required token scopes: crm.objects.companies.read, crm.associations.read, crm.objects.contacts.read")
 
 if __name__ == "__main__":
     main()
