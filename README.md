@@ -1,212 +1,247 @@
-# HubSpot Company Deduplication Tools
+# HubSpot Company Deduplication Toolkit
 
-This repository contains Python scripts to **identify, analyze, and merge duplicate company records in HubSpot** via the official CRM API.  
-All scripts use a HubSpot **Private App token** stored securely in a `.env` file.
+This repository contains a complete workflow for identifying, reviewing, and merging duplicate **HubSpot companies** safely and efficiently.
+
+The toolkit supports:
+- Exporting all canonical companies from HubSpot  
+- Detecting duplicates using **exact matching**, **canonical chain analysis**, and **fuzzy matching**
+- Generating manual review CSVs
+- Automatically merging companies based on rules
+- Interactive fuzzy merging with human confirmation
 
 ---
 
-## 📦 Scripts Overview
+# 📌 Overview of the Full Workflow
 
-### 1. `company_duplicates.py`
-Purpose: **Detect and export duplicate companies using multiple strategies.**
+Below is the recommended **end-to-end process** using all scripts in the repository.
 
-- Fetches all companies via the HubSpot API.  
-- Normalizes domains (lowercase, strip `www.`).  
-- Normalizes company names (case-folding, punctuation/whitespace cleanup, removing common suffixes like “Oy”, “Ltd”).  
-- Derives **contact-based domains**: if a company has associated contacts with emails like `user@acme.com`, the most common non-freemail domain (`acme.com`) is used as the company’s effective domain.  
-- Groups companies by:
-  - **Company domain** (property `domain`)  
-  - **Company name** (normalized)  
-  - **Contact-derived domain**  
-- Identifies groups where multiple companies share the same key.  
-- Writes all duplicate records to `data/duplicates_YYYYMMDD-HHMMSS.csv`.  
+---
 
-Output CSV columns:
-```
-id;domain;name;match_type;match_key
-```
-- `match_type` = `company_domain`, `company_name`, or `contact_domain`  
-- `match_key` = the actual domain or normalized name that matched  
+## 1. Export All Canonical Companies  
+**Script:** `export_all_companies.py`
 
-Usage examples:
+Exports every company from HubSpot **but only the canonical master objects**, avoiding merged historical items.
+
+**Command:**
 ```bash
-# Default: run all rules (domain + name + contact domain)
-python company_duplicates.py
-
-# Disable contact-domain grouping
-python company_duplicates.py --no-by-contact-domain
-
-# Disable name grouping
-python company_duplicates.py --no-by-name
+python export_all_companies.py --limit 50
+python export_all_companies.py          # full export (~20k companies)
 ```
 
-Console output also shows:
-- How many companies were fetched  
-- How many lacked a domain  
-- How many got a contact-derived domain  
-- Counts of groups and rows found for each match type  
-
-Result example:
+Output example:
 ```
-✅ Saved 732 rows to data/duplicates_20250825-101530.csv
-Groups found -> by_domain: 120 (rows 480), by_name: 35 (rows 140), contact_domain: 12 (rows 112)
-Note: contact_domain derived from associated contacts' emails (freemail domains ignored).
+data/all_companies_20251121-113507.csv
 ```
 
 ---
 
-### 2. `company_merge.py`
-Purpose: **Safely merge duplicate companies into a single “primary” record.**
+## 2. Detect Deterministic Duplicates  
+**Script:** `company_duplicates.py`
 
-- Reads a semicolon-separated CSV (format: `id;domain;name;match_type;match_key`)  
-- Groups records by domain.  
-- Fetches metadata (`name`, `domain`, `hs_createdate`, `createdate`).  
-- Selects a **primary record** per group:  
-  - The oldest `createdate` if available, otherwise the numerically smallest ID.  
-- Resolves **canonical company IDs** (handles HubSpot’s alias / forward references).  
-- Merges duplicates into the chosen primary via HubSpot’s **merge endpoint**.  
-- Writes a **log file** with all actions: `logs/merge_log_YYYYMMDD-HHMMSS.csv`.
+Finds duplicates using:
+- exact name match  
+- exact domain match  
+- HubSpot "canonical roots"  
 
-Log CSV columns:
-```
-domain;primary_id;primary_name;primary_created_raw;mergee_id;mergee_name;mergee_created_raw;status
-```
+Produces a CSV of duplicates that are **safe to auto-merge**.
 
-Two modes:
-- **Dry-run (default)**: No changes in HubSpot, only prints plan and logs as `DRY_RUN`.
-- **Apply mode (`--apply`)**: Actually performs merges, logs as `MERGED`.
-
-Usage:
+**Command:**
 ```bash
-# Dry-run (safe to test)
-python company_merge.py ./data/duplicates.csv
+python company_duplicates.py --input data/all_companies_*.csv
+```
 
-# Apply changes (performs merges in HubSpot)
-python company_merge.py ./data/duplicates.csv --apply
+Output example:
+```
+data/company_duplicates_2025-11-21.csv
 ```
 
 ---
 
-### 3. `company_test.py`
-Purpose: **Test connectivity to the HubSpot API.**
+## 3. Detect Fuzzy / Near-Duplicates  
+**Script:** `company_duplicates_fuzzy.py`
 
-- Loads token from `.env`.  
-- Fetches a single company with `name` and `domain`.  
-- Confirms whether the token is valid and API access works.
+Finds more complex duplicates using:
+- token blocking
+- domain weighting
+- aggressive name normalization
+- similarity scoring (threshold adjustable)
 
-Usage:
+This script produces a CSV of **candidate fuzzy matches**.
+
+**Command:**
 ```bash
-python company_test.py
+python company_duplicates_fuzzy.py --input data/all_companies_*.csv --min-score 95
 ```
 
-Output examples:
+Output example:
 ```
-✅ Connection works!
-First company: {'id': '123456789', 'properties': {'name': 'Example Oy', 'domain': 'example.com'}}
+data/company_duplicates_fuzzy_2025-11-21.csv
 ```
-or
+
+These are *candidates*, not confirmed duplicates.
+
+---
+
+## 4. Convert Fuzzy Matches to Mergeable ID-Clusters  
+**Script:** `merge_fuzzy_ids.py`
+
+Reads the fuzzy matches and forms **merge clusters** (groups of IDs belonging to the same company).
+
+This script normalizes group keys, sanitizes results, and outputs a CSV that can be merged automatically.
+
+**Command:**
+```bash
+python merge_fuzzy_ids.py --input data/company_duplicates_fuzzy_*.csv
 ```
-❌ Error: 401 {"message":"Invalid authentication credentials"}
+
+Output example:
+```
+data/manual_review_from_fuzzy_2025-11-21.csv
 ```
 
 ---
 
-## ⚙️ Setup Instructions
+## 5. Merge Companies by Name or Fuzzy Cluster  
+**Script:** `merge_by_name.py`
 
-1. **Clone the repository**
+This is the main merge engine.
+
+It supports two paths:
+
+### A) Merge deterministic name duplicates  
+When manual review CSV contains multiple IDs for the same `group_key`:
+
 ```bash
-git clone https://github.com/<your-org>/<repo-name>.git
-cd <repo-name>
+python merge_by_name.py --file data/manual_review.csv --apply
 ```
 
-2. **Create and activate a Python environment**
-```bash
-python3 -m venv venv
-source venv/bin/activate   # Linux/macOS
-venv\Scripts\activate      # Windows
+### B) Merge fuzzy clusters  
+When merge_fuzzy_ids produced clusters like:
+
+```
+group_key=“viking line”
+ids=[6997014895, 20477930508]
 ```
 
-3. **Install dependencies**
+Same command merges them.
+
+Features:
+- Automatically picks oldest canonical as primary
+- Automatic retry when HubSpot returns “forward reference”
+- Logs all merges
+- Prints a summary like:
+  ```
+  Merged: Nokia Group <-> Nokia Oy
+  ```
+
+---
+
+## 6. Merge Companies Using CSV From company_merge.py  
+**Script:** `company_merge.py`
+
+This script processes deterministic duplicate CSVs from `company_duplicates.py`.
+
+It:
+- Merges safely where HubSpot canonical chain allows it  
+- Writes a `manual_review_xxx.csv` when user intervention is required  
+- Does **not** automatically merge across canonical boundaries  
+
+**Command:**
+```bash
+python company_merge.py data/dupes.csv --apply
+```
+
+---
+
+# 📂 Files in Repository
+
+| File | Purpose |
+|------|---------|
+| `.env` | Stores `HUBSPOT_TOKEN` |
+| `company_duplicates.py` | Finds exact duplicates |
+| `company_duplicates_fuzzy.py` | Finds fuzzy/near duplicates |
+| `company_merge.py` | Merges deterministic duplicates |
+| `merge_by_name.py` | Merges name-based or fuzzy clusters |
+| `merge_fuzzy_ids.py` | Groups fuzzy matches into merge clusters |
+| `export_all_companies.py` | Exports all canonical companies |
+| `company_test.py` | Small test harness |
+| `requirements.txt` | Python dependencies |
+| `README.md` | Documentation |
+
+---
+
+# 🧠 How Merge Logic Works
+
+### Deterministic merges
+- Strict match by domain, name, or canonical root
+- Safe → auto-merge
+
+### Fuzzy merges
+- The system uses:
+  - Token similarity
+  - Normalized company names
+  - Domain similarity weighting
+  - Removal of legal suffixes (Oy, AB, AS, GmbH…)
+  - Removal of weak business suffixes (Group, Holding)
+- Merge only after human confirmation
+
+---
+
+# 🧪 Interactive Fuzzy Merge (optional)
+`merge_by_name.py` supports interactive fuzzy merge:
+
+```
+Fuzzy match detected:
+  bluugo  <->  bluugo oy
+Similarity: 97%
+
+Merge? (y/n)
+```
+
+This prevents unintended merges.
+
+---
+
+# ✔ Recommended Workflow Summary
+
+1. **Export all canonical companies**  
+   → `export_all_companies.py`
+
+2. **Find deterministic duplicates**  
+   → `company_duplicates.py`
+
+3. **Find fuzzy duplicates**  
+   → `company_duplicates_fuzzy.py`
+
+4. **Build merge clusters from fuzzy results**  
+   → `merge_fuzzy_ids.py`
+
+5. **Review & merge**  
+   → `merge_by_name.py --apply`
+
+6. **Finalize safe merges**  
+   → `company_merge.py --apply`
+
+---
+
+# 📘 Example Environment Setup
+
+`.env`:
+```
+HUBSPOT_TOKEN=your-token-here
+```
+
+Install dependencies:
 ```bash
 pip install -r requirements.txt
 ```
 
-4. **Configure environment**
-Create a `.env` file in the project root:
-```
-HUBSPOT_TOKEN=pat-xxxxxx-your-private-app-token
-```
-
-⚠️ `.env` is ignored by `.gitignore`. Never commit your token to GitHub.
-
 ---
 
-## 🗂 Repository Structure
+If you want, I can add:
 
-```
-.
-├── company_duplicates.py   # Detect duplicates by domain, name, and contact-derived domain
-├── company_merge.py        # Merge duplicates into a single primary, with logging
-├── company_test.py         # Connectivity test script
-├── data/                   # Duplicate exports (gitignored, only .gitkeep committed)
-│   └── .gitkeep
-├── logs/                   # Merge logs (gitignored, only .gitkeep committed)
-│   └── .gitkeep
-├── .env_example            # Example environment file
-├── .gitignore              # Ignores sensitive and generated files
-└── README.md               # This file
-```
-
----
-
-## 🔒 Safety Notes
-
-- Always **run `company_merge.py` without `--apply` first** to verify which records would be merged.  
-- The merge operation in HubSpot is **irreversible**. Once merged, a company cannot be split back.  
-- All associated records (contacts, deals, tickets) of merged companies are reassigned to the primary.  
-- Primary company’s property values take precedence. Some multi-value fields may merge automatically.  
-
----
-
-## 🚀 Typical Workflow
-
-1. Detect duplicates:
-```bash
-python company_duplicates.py
-```
-→ Produces `data/duplicates_YYYYMMDD-HHMMSS.csv`
-
-2. Review CSV manually (optional).  
-
-3. Dry-run merge plan:
-```bash
-python company_merge.py ./data/duplicates_YYYYMMDD-HHMMSS.csv
-```
-
-4. Apply merges:
-```bash
-python company_merge.py ./data/duplicates_YYYYMMDD-HHMMSS.csv --apply
-```
-
-5. Check log file in `logs/` for audit trail.
-
----
-
-## 🧪 Example Dry-Run Output
-
-```
-=== Domain: example.com — 3 records (primary: 12345 / 'Example Oy')
-    created: 2020-02-12 10:00:00+00:00 (raw: 2020-02-12T10:00:00Z)
-    merge candidates: 2
-    DRY_RUN: 67890 -> 12345
-    DRY_RUN: 54321 -> 12345
-
-Completed. Would merge 2 records in 1 domain group.
-📄 Log saved: logs/merge_log_20250822-101200.csv
-```
-
----
-
-## 📜 License
-
-MIT License. See [LICENSE](LICENSE) for details.
+- ASCII workflow diagrams  
+- A visual flowchart (PNG)  
+- Example input/output CSVs  
+- A troubleshooting chapter  
+- Auto-fix instructions for common HubSpot API errors  
