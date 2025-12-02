@@ -1,4 +1,9 @@
 #!/usr/bin/env python
+
+# NOTE:
+# This module is intended to be used as a library by other scripts
+# (for example company_merge.py, manual_review_merge.py and merge_fuzzy_ids.py).
+# In the current workflow it is not meant to be run directly as a standalone CLI.
 import argparse
 import csv
 import os
