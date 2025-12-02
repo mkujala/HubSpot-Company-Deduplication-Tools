@@ -20,6 +20,9 @@ HUBSPOT_BASE = "https://api.hubapi.com"
 
 
 def get_session_and_headers() -> Tuple[requests.Session, Dict[str, str]]:
+    """
+    Initialize a requests session and build default headers for HubSpot API.
+    """
     if not HUBSPOT_TOKEN:
         print("ERROR: HUBSPOT_TOKEN is not set in environment (.env).")
         sys.exit(1)
@@ -39,8 +42,11 @@ def hubspot_company_search(
     operator: str,
 ) -> List[Dict[str, Any]]:
     """
-    Low-level helper to search companies by name with a given operator.
-    operator: 'EQ' or 'CONTAINS_TOKEN'
+    Low level helper to search companies by name with a given operator.
+
+    operator:
+      - "EQ" for exact match
+      - "CONTAINS_TOKEN" for token based fuzzy search
     """
     url = f"{HUBSPOT_BASE}/crm/v3/objects/companies/search"
     body: Dict[str, Any] = {
@@ -94,12 +100,18 @@ def search_companies_fuzzy(
 ) -> List[Dict[str, Any]]:
     """
     Fuzzy search using CONTAINS_TOKEN for company name.
-    Used only for interactive confirmation, never auto-merged.
+    Used only for interactive confirmation, never auto merged.
     """
     return hubspot_company_search(session, headers, name, operator="CONTAINS_TOKEN")
 
 
 def parse_createdate_from_properties(props: Dict[str, Any]) -> datetime:
+    """
+    Parse HubSpot createdate property to timezone aware datetime.
+
+    If createdate is missing or invalid, returns datetime.max in UTC
+    so that it sorts as "latest".
+    """
     raw = props.get("createdate")
     if not raw:
         return datetime.max.replace(tzinfo=timezone.utc)
@@ -111,6 +123,9 @@ def parse_createdate_from_properties(props: Dict[str, Any]) -> datetime:
 
 
 def parse_createdate(obj: Dict[str, Any]) -> datetime:
+    """
+    Convenience wrapper for objects that contain a "properties" payload.
+    """
     props = obj.get("properties", {}) or {}
     return parse_createdate_from_properties(props)
 
@@ -122,7 +137,11 @@ def fetch_company(
     props: Optional[List[str]] = None,
 ) -> Optional[Dict[str, Any]]:
     """
-    Fetch a single company by ID. Returns None if not found (404).
+    Fetch a single company by ID.
+
+    Returns:
+      - full JSON object if found
+      - None if not found (404) or on other non 200 errors
     """
     if props is None:
         props = ["hs_canonical_object_id", "createdate", "name", "domain"]
@@ -150,8 +169,10 @@ def resolve_canonical_id(
     max_depth: int = 10,
 ) -> str:
     """
-    Resolve the final canonical company ID for the given company_id
-    by following hs_canonical_object_id until it is empty or stable.
+    Resolve the final canonical company ID for a given company ID.
+
+    Follows hs_canonical_object_id chain until it is empty or stable.
+    Uses a small depth limit to avoid accidental infinite loops.
     """
     if company_id in cache:
         return cache[company_id]
@@ -194,6 +215,13 @@ def merge_pair(
     primary_id: str,
     secondary_id: str,
 ) -> Tuple[bool, str]:
+    """
+    Perform one HubSpot merge API call.
+
+    Returns:
+      (True, "MERGED") on success
+      (False, "HTTP ...") with raw error on failure
+    """
     url = f"{HUBSPOT_BASE}/crm/v3/objects/companies/merge"
     payload = {"primaryObjectId": primary_id, "objectIdToMerge": secondary_id}
     resp = session.post(url, headers=headers, json=payload)
@@ -208,18 +236,23 @@ def merge_companies_for_name(
     name: str,
     dry_run: bool,
     sleep_seconds: float = 0.3,
-) -> Tuple[int, int, bool, bool, bool]:
+) -> Tuple[int, int, bool, bool, bool, List[str]]:
     """
     Merge all companies with the given name into a single canonical.
 
     Returns:
-      success_count, failure_count, had_any_companies,
-      fuzzy_candidates_found, fuzzy_merge_performed
+      success_count
+      failure_count
+      had_any_companies   -> whether any company was found at all
+      fuzzy_candidates_found
+      fuzzy_merge_performed
+      merged_pairs        -> list of "from_name -> to_name" strings
     """
     success_count = 0
     failure_count = 0
     fuzzy_candidates_found = False
     fuzzy_merge_performed = False
+    merged_pairs: List[str] = []
 
     print(f"\n=== Name: {name} ===")
 
@@ -231,7 +264,7 @@ def merge_companies_for_name(
         fuzzy_companies = search_companies_fuzzy(session, headers, name)
         if len(fuzzy_companies) == 0:
             print("  No companies found (exact or fuzzy).")
-            return success_count, failure_count, False, False, False
+            return success_count, failure_count, False, False, False, merged_pairs
 
         fuzzy_candidates_found = True
         print("  No exact EQ matches, but fuzzy search (CONTAINS_TOKEN) returned:")
@@ -246,7 +279,7 @@ def merge_companies_for_name(
             print(
                 "  DRY RUN: would ask for confirmation to fuzzy merge, skipping for this name."
             )
-            return success_count, failure_count, True, True, False
+            return success_count, failure_count, True, True, False, merged_pairs
 
         answer = input(
             f"  Do you want to fuzzy-merge name '{name}' into the companies listed above? [y/N]: "
@@ -254,7 +287,7 @@ def merge_companies_for_name(
 
         if answer not in ("y", "yes"):
             print("  Skipping fuzzy merge for this name.")
-            return success_count, failure_count, True, True, False
+            return success_count, failure_count, True, True, False, merged_pairs
 
         print("  Proceeding with fuzzy merge for this name.")
         companies = fuzzy_companies
@@ -264,9 +297,20 @@ def merge_companies_for_name(
     if len(companies) == 1:
         c = companies[0]
         print(f"  Only one company found (ID {c['id']}). Nothing to merge.")
-        return success_count, failure_count, True, fuzzy_candidates_found, fuzzy_merge_performed
+        return success_count, failure_count, True, fuzzy_candidates_found, fuzzy_merge_performed, merged_pairs
 
     print(f"  Found {len(companies)} companies with this name.")
+
+    # Build a mapping for easy name lookup
+    company_objs: Dict[str, Dict[str, Any]] = {c["id"]: c for c in companies}
+
+    def company_name(company_id: str) -> str:
+        obj = company_objs.get(company_id)
+        if not obj:
+            return company_id
+        props = obj.get("properties", {}) or {}
+        n = props.get("name") or ""
+        return n if n else company_id
 
     # Resolve canonical IDs
     canonical_cache: Dict[str, str] = {}
@@ -285,7 +329,7 @@ def merge_companies_for_name(
             initial_properties=props,
         )
         canonical_ids.add(canonical_id)
-        print(f"    Company {cid} -> canonical {canonical_id}")
+        print(f"    Company {cid} ('{company_name(cid)}') -> canonical {canonical_id}")
 
     # Determine final primary canonical
     if len(canonical_ids) == 1:
@@ -302,6 +346,7 @@ def merge_companies_for_name(
                 created = datetime.max.replace(tzinfo=timezone.utc)
             else:
                 created = parse_createdate(obj)
+                company_objs.setdefault(canon_id, obj)
             canonical_list.append((canon_id, created))
             print(f"    Canonical candidate {canon_id}, created {created.isoformat()}")
 
@@ -310,22 +355,27 @@ def merge_companies_for_name(
         print(f"  Selected final primary canonical ID {final_primary_id} (oldest createdate).")
 
     print("  All candidate companies for this name:")
-    for c in companies:
-        cid = c["id"]
-        created = parse_createdate(c)
-        print(f"    - ID {cid}, created {created.isoformat()}")
+    for cid, obj in company_objs.items():
+        created = parse_createdate(obj)
+        print(f"    - ID {cid}, name '{company_name(cid)}', created {created.isoformat()}")
 
     if dry_run:
         print("  DRY RUN: no merges executed.")
-        return success_count, failure_count, True, fuzzy_candidates_found, fuzzy_merge_performed
+        return success_count, failure_count, True, fuzzy_candidates_found, fuzzy_merge_performed, merged_pairs
 
     forward_ref_re = re.compile(r"forward reference to (\d+)")
 
-    for cid in all_ids:
+    # Sort for deterministic behaviour
+    all_ids_sorted = sorted(all_ids)
+
+    for cid in all_ids_sorted:
         if cid == final_primary_id:
             continue
 
-        print(f"  Merging {cid} -> {final_primary_id}")
+        src_name = company_name(cid)
+        dst_name = company_name(final_primary_id)
+
+        print(f"  Merging {cid} ('{src_name}') -> {final_primary_id} ('{dst_name}')")
         ok, info = merge_pair(session, headers, final_primary_id, cid)
 
         if not ok and "forward reference to" in info:
@@ -337,12 +387,26 @@ def merge_companies_for_name(
                         f"    Forward reference detected. Switching primary to {new_primary} and retrying."
                     )
                     final_primary_id = new_primary
+
+                    # Ensure we have data for the new primary for name printing
+                    if new_primary not in company_objs:
+                        obj = fetch_company(
+                            session,
+                            headers,
+                            new_primary,
+                            props=["hs_canonical_object_id", "createdate", "name", "domain"],
+                        )
+                        if obj is not None:
+                            company_objs[new_primary] = obj
+
+                    dst_name = company_name(final_primary_id)
                     ok_retry, info_retry = merge_pair(
                         session, headers, final_primary_id, cid
                     )
                     if ok_retry:
                         print(f"    RESULT: OK (after primary switch) | {info_retry}")
                         success_count += 1
+                        merged_pairs.append(f"{src_name} -> {dst_name}")
                     else:
                         print(f"    RESULT: FAIL (after primary switch) | {info_retry}")
                         failure_count += 1
@@ -351,6 +415,7 @@ def merge_companies_for_name(
 
         if ok:
             success_count += 1
+            merged_pairs.append(f"{src_name} -> {dst_name}")
         else:
             failure_count += 1
 
@@ -358,7 +423,264 @@ def merge_companies_for_name(
         time.sleep(sleep_seconds)
 
     print("  Done.")
-    return success_count, failure_count, True, fuzzy_candidates_found, fuzzy_merge_performed
+    return (
+        success_count,
+        failure_count,
+        True,
+        fuzzy_candidates_found,
+        fuzzy_merge_performed,
+        merged_pairs,
+    )
+
+
+def load_id_groups_from_file(path: str) -> Dict[str, Set[str]]:
+    """
+    Load groups of company IDs from a semicolon separated CSV.
+
+    Supports:
+      1) Fuzzy or name based manual review with an explicit id_list column:
+         group_type;group_key;id_list;...
+
+         where id_list = "123,456,789"
+
+      2) company_merge.py manual_review format:
+         group_type;group_key;primary_id;secondary_id;suggested_canonical_id;error
+
+         where all three ID columns are combined into one cluster.
+    """
+    groups: Dict[str, Set[str]] = {}
+
+    with open(path, "r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f, delimiter=";")
+        if not reader.fieldnames:
+            return {}
+
+        fieldnames = [fn.strip() for fn in reader.fieldnames]
+        has_id_list = "id_list" in fieldnames
+        has_primary = "primary_id" in fieldnames
+        has_secondary = "secondary_id" in fieldnames
+        has_suggested = "suggested_canonical_id" in fieldnames
+
+        for row in reader:
+            group_key = (row.get("group_key") or "").strip()
+            if not group_key:
+                continue
+
+            if group_key not in groups:
+                groups[group_key] = set()
+
+            # Case 1: explicit id_list from fuzzy/manual review
+            if has_id_list:
+                raw_ids = (row.get("id_list") or "").strip()
+                if raw_ids:
+                    for cid in raw_ids.split(","):
+                        cid = cid.strip()
+                        if cid:
+                            groups[group_key].add(cid)
+
+            # Case 2: manual_review from company_merge.py
+            if has_primary or has_secondary or has_suggested:
+                for col in ("primary_id", "secondary_id", "suggested_canonical_id"):
+                    if col in row:
+                        val = (row.get(col) or "").strip()
+                        if val:
+                            groups[group_key].add(val)
+
+    # Remove empty groups
+    return {k: v for k, v in groups.items() if v}
+
+
+def merge_companies_for_id_group(
+    session: requests.Session,
+    headers: Dict[str, str],
+    group_key: str,
+    ids: Set[str],
+    dry_run: bool,
+    sleep_seconds: float = 0.3,
+) -> Tuple[int, int, List[str]]:
+    """
+    Merge companies for a given group_key using an explicit set of IDs.
+
+    Uses the same canonical resolution logic as merge_companies_for_name,
+    but does not search by name. Instead it operates directly on known IDs.
+
+    Returns:
+      success_count
+      failure_count
+      merged_pairs -> list of "from_name -> to_name" strings
+    """
+    success_count = 0
+    failure_count = 0
+    merged_pairs: List[str] = []
+
+    print(f"\n=== Group: {group_key} ===")
+
+    if len(ids) <= 1:
+        print("  Only one or zero IDs in this group. Nothing to merge.")
+        return success_count, failure_count, merged_pairs
+
+    # Fetch all company objects
+    company_objs: Dict[str, Dict[str, Any]] = {}
+    for cid in sorted(ids):
+        obj = fetch_company(
+            session,
+            headers,
+            cid,
+            props=["hs_canonical_object_id", "createdate", "name", "domain"],
+        )
+        if obj is None:
+            print(f"  WARNING: company {cid} not found, skipping.")
+            continue
+        company_objs[cid] = obj
+
+    if len(company_objs) <= 1:
+        print("  Only one valid company found in HubSpot for this group. Nothing to merge.")
+        return success_count, failure_count, merged_pairs
+
+    def company_name(company_id: str) -> str:
+        obj = company_objs.get(company_id)
+        if not obj:
+            return company_id
+        props = obj.get("properties", {}) or {}
+        n = props.get("name") or ""
+        return n if n else company_id
+
+    # Resolve canonical IDs
+    canonical_cache: Dict[str, str] = {}
+    canonical_ids: Set[str] = set()
+
+    for cid, obj in company_objs.items():
+        props = obj.get("properties", {}) or {}
+        canonical_id = resolve_canonical_id(
+            session,
+            headers,
+            canonical_cache,
+            cid,
+            initial_properties=props,
+        )
+        canonical_ids.add(canonical_id)
+        print(f"  Company {cid} ('{company_name(cid)}') -> canonical {canonical_id}")
+
+    # Determine final primary canonical
+    if len(canonical_ids) == 1:
+        final_primary_id = next(iter(canonical_ids))
+        print(f"  Single canonical for this group: {final_primary_id}")
+    else:
+        print(f"  Multiple canonical IDs found for this group: {', '.join(canonical_ids)}")
+        canonical_list: List[Tuple[str, datetime]] = []
+        for canon_id in canonical_ids:
+            obj = fetch_company(
+                session, headers, canon_id, props=["createdate", "name", "domain"]
+            )
+            if obj is None:
+                created = datetime.max.replace(tzinfo=timezone.utc)
+            else:
+                created = parse_createdate(obj)
+                company_objs.setdefault(canon_id, obj)
+            canonical_list.append((canon_id, created))
+            print(f"    Canonical candidate {canon_id}, created {created.isoformat()}")
+
+        canonical_list.sort(key=lambda t: t[1])
+        final_primary_id = canonical_list[0][0]
+        print(
+            f"  Selected final primary canonical ID {final_primary_id} (oldest createdate)."
+        )
+
+    print("  All candidate companies for this group:")
+    for cid, obj in company_objs.items():
+        created = parse_createdate(obj)
+        print(
+            f"    - ID {cid}, name '{company_name(cid)}', created {created.isoformat()}"
+        )
+
+    if dry_run:
+        print("  DRY RUN: no merges executed.")
+        return success_count, failure_count, merged_pairs
+
+    forward_ref_re = re.compile(r"forward reference to (\d+)")
+
+    # Sort IDs for deterministic behavior
+    all_ids_sorted = sorted(company_objs.keys())
+
+    for cid in all_ids_sorted:
+        if cid == final_primary_id:
+            continue
+
+        src_name = company_name(cid)
+        dst_name = company_name(final_primary_id)
+
+        print(
+            f"  Merging {cid} ('{src_name}') -> {final_primary_id} ('{dst_name}')"
+        )
+        ok, info = merge_pair(session, headers, final_primary_id, cid)
+
+        if not ok and "forward reference to" in info:
+            match = forward_ref_re.search(info)
+            if match:
+                new_primary = match.group(1)
+
+                # Case A: secondary already canonically points to the current primary.
+                # Example: trying 1579... -> 4633..., and error says:
+                #   "objectId=1579... has a forward reference to 4633..."
+                # In that situation the merge is redundant and can be treated as success.
+                if new_primary == final_primary_id:
+                    print(
+                        "    Forward reference indicates that source already canonicalises "
+                        f"to {final_primary_id}. Treating as merged."
+                    )
+                    success_count += 1
+                    merged_pairs.append(f"{src_name} -> {dst_name}")
+                    time.sleep(sleep_seconds)
+                    continue
+
+                # Case B: current primary is not canonical and needs to be switched.
+                if new_primary != final_primary_id:
+                    print(
+                        f"    Forward reference detected. Switching primary to {new_primary} and retrying."
+                    )
+                    final_primary_id = new_primary
+
+                    # Ensure we have data for the new primary for name printing
+                    if new_primary not in company_objs:
+                        obj = fetch_company(
+                            session,
+                            headers,
+                            new_primary,
+                            props=[
+                                "hs_canonical_object_id",
+                                "createdate",
+                                "name",
+                                "domain",
+                            ],
+                        )
+                        if obj is not None:
+                            company_objs[new_primary] = obj
+
+                    dst_name = company_name(final_primary_id)
+                    ok_retry, info_retry = merge_pair(
+                        session, headers, final_primary_id, cid
+                    )
+                    if ok_retry:
+                        print(f"    RESULT: OK (after primary switch) | {info_retry}")
+                        success_count += 1
+                        merged_pairs.append(f"{src_name} -> {dst_name}")
+                    else:
+                        print(f"    RESULT: FAIL (after primary switch) | {info_retry}")
+                        failure_count += 1
+                    time.sleep(sleep_seconds)
+                    continue
+
+        if ok:
+            success_count += 1
+            merged_pairs.append(f"{src_name} -> {dst_name}")
+        else:
+            failure_count += 1
+
+        print(f"    RESULT: {'OK' if ok else 'FAIL'} | {info}")
+        time.sleep(sleep_seconds)
+
+    print("  Done.")
+    return success_count, failure_count, merged_pairs
 
 
 def collect_names_from_manual_review(path: str) -> List[str]:
@@ -383,8 +705,12 @@ def collect_names_from_manual_review(path: str) -> List[str]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Merge HubSpot companies by name, either directly via --name "
-            "or using a CSV file (e.g. manual_review from company_merge.py)."
+            "Merge HubSpot companies by name or ID groups.\n\n"
+            "Usage examples:\n"
+            "  - Merge by explicit name:\n"
+            "      python merge_by_name.py --name \"Some Company\" --apply\n"
+            "  - Merge groups from CSV (manual_review from company_merge.py or fuzzy):\n"
+            "      python merge_by_name.py --file data/manual_review_*.csv --apply"
         )
     )
     parser.add_argument(
@@ -395,7 +721,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--file",
         dest="file",
-        help="Path to CSV produced by company_merge.py (e.g. manual_review_*.csv).",
+        help=(
+            "Path to CSV produced by company_merge.py (manual_review_*.csv) or "
+            "fuzzy duplicates (with id_list column)."
+        ),
     )
     parser.add_argument(
         "--apply",
@@ -411,6 +740,41 @@ def main() -> None:
 
     session, headers = get_session_and_headers()
 
+    total_success = 0
+    total_failure = 0
+    all_merged_pairs: List[str] = []
+
+    # 1. If file is given, first try ID based groups (manual_review from company_merge or fuzzy)
+    if args.file:
+        id_groups = load_id_groups_from_file(args.file)
+        if id_groups:
+            print(f"Loaded {len(id_groups)} groups from file (ID based).")
+            if dry_run:
+                print("DRY RUN mode. Use --apply to execute merges.")
+
+            for group_key in sorted(id_groups.keys()):
+                ids = id_groups[group_key]
+                s, f, pairs = merge_companies_for_id_group(
+                    session, headers, group_key, ids, dry_run=dry_run
+                )
+                total_success += s
+                total_failure += f
+                all_merged_pairs.extend(pairs)
+
+            print("\nSummary (ID groups):")
+            print(f"  Groups processed: {len(id_groups)}")
+            print(f"  Merges successful: {total_success}")
+            print(f"  Merges failed: {total_failure}")
+
+            if all_merged_pairs:
+                print("  Merged company name pairs:")
+                for pair in all_merged_pairs:
+                    print(f"    - {pair}")
+
+            print("All done.")
+            return
+
+    # 2. Name based mode (either from --name or manual_review company_name rows)
     names: List[str] = []
 
     if args.name:
@@ -418,7 +782,8 @@ def main() -> None:
 
     if args.file:
         auto_names = collect_names_from_manual_review(args.file)
-        print(f"Loaded {len(auto_names)} names from file.")
+        if auto_names:
+            print(f"Loaded {len(auto_names)} names from file.")
         names.extend(auto_names)
 
     # Deduplicate while preserving order
@@ -430,25 +795,31 @@ def main() -> None:
             unique_names.append(n)
 
     if not unique_names:
-        print("No names to process.")
+        print("No names or ID groups to process.")
         return
 
     print(f"Processing {len(unique_names)} names.")
     if dry_run:
         print("DRY RUN mode. Use --apply to execute merges.")
 
-    total_success = 0
-    total_failure = 0
     names_with_no_matches: List[str] = []
     names_with_fuzzy_candidates_skipped: List[str] = []
     names_with_fuzzy_merged: List[str] = []
 
     for name in unique_names:
-        s, f, had_any, fuzzy_found, fuzzy_merged = merge_companies_for_name(
+        (
+            s,
+            f,
+            had_any,
+            fuzzy_found,
+            fuzzy_merged,
+            pairs,
+        ) = merge_companies_for_name(
             session, headers, name, dry_run=dry_run
         )
         total_success += s
         total_failure += f
+        all_merged_pairs.extend(pairs)
 
         if not had_any:
             names_with_no_matches.append(name)
@@ -457,10 +828,15 @@ def main() -> None:
         elif fuzzy_merged:
             names_with_fuzzy_merged.append(name)
 
-    print("\nSummary:")
+    print("\nSummary (name based):")
     print(f"  Names processed: {len(unique_names)}")
     print(f"  Merges successful: {total_success}")
     print(f"  Merges failed: {total_failure}")
+
+    if all_merged_pairs:
+        print("  Merged company name pairs:")
+        for pair in all_merged_pairs:
+            print(f"    - {pair}")
 
     if names_with_no_matches:
         print("  Names with no HubSpot matches (exact or fuzzy):")

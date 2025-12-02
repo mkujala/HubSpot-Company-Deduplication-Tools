@@ -87,28 +87,42 @@ def email_to_domain(email: str | None) -> str:
 # ---------- data fetching ----------
 def fetch_all_companies(s: requests.Session) -> list[dict]:
     """
-    Returns a list of dicts: {id, name, domain}
+    Returns a list of dicts: {id, name, domain, business_id}.
     """
     out = []
-    params = {"limit": PAGE_LIMIT, "archived": "false", "properties": "name,domain"}
+    params = {
+        "limit": PAGE_LIMIT,
+        "archived": "false",
+        "properties": "name,domain,business_id",
+    }
+    url = BASE + COMPANY_LIST
     after = None
+
     while True:
         if after:
             params["after"] = after
-        r = request_with_retry(s, "GET", BASE + COMPANY_LIST, params=params)
+        r = request_with_retry(s, "GET", url, params=params)
         if r.status_code != 200:
             raise RuntimeError(f"Company list error {r.status_code}: {r.text}")
-        data = r.json()
-        for item in data.get("results", []):
-            p = item.get("properties", {}) or {}
-            out.append({
-                "id": item["id"],
-                "name": (p.get("name") or "").strip(),
-                "domain": norm_domain(p.get("domain")),
-            })
+        data = r.json() if r.text else {}
+        results = data.get("results") or []
+        for row in results:
+            cid = row.get("id")
+            props = row.get("properties") or {}
+            if not cid:
+                continue
+            out.append(
+                {
+                    "id": str(cid),
+                    "name": (props.get("name") or "").strip(),
+                    "domain": norm_domain(props.get("domain")),
+                    "business_id": (props.get("business_id") or "").strip(),
+                }
+            )
         after = data.get("paging", {}).get("next", {}).get("after")
         if not after:
             break
+
     return out
 
 def batch_read_associations_company_contacts(s: requests.Session, company_ids: list[str]) -> dict[str, list[str]]:
@@ -193,16 +207,37 @@ def derive_contact_domain_for_companies(
 # ---------- main ----------
 def main():
     ap = argparse.ArgumentParser(
-        description="Find HubSpot company duplicates by domain, normalized name, and contact-derived email domains."
+        description=(
+            "Find HubSpot company duplicates by domain, normalized name, business_id, "
+            "and contact-derived email domains."
+        )
     )
     # All strategies ON by default; can be disabled with flags
-    ap.add_argument("--no-by-domain", action="store_true", help="Disable grouping by company domain.")
-    ap.add_argument("--no-by-name", action="store_true", help="Disable grouping by normalized company name.")
-    ap.add_argument("--no-by-contact-domain", action="store_true", help="Disable grouping by contact-derived domain.")
+    ap.add_argument(
+        "--no-by-domain",
+        action="store_true",
+        help="Disable grouping by company domain.",
+    )
+    ap.add_argument(
+        "--no-by-name",
+        action="store_true",
+        help="Disable grouping by normalized company name.",
+    )
+    ap.add_argument(
+        "--no-by-business-id",
+        action="store_true",
+        help="Disable grouping by business_id custom property.",
+    )
+    ap.add_argument(
+        "--no-by-contact-domain",
+        action="store_true",
+        help="Disable grouping by contact-derived domain.",
+    )
     args = ap.parse_args()
 
     use_by_domain = not args.no_by_domain
     use_by_name = not args.no_by_name
+    use_by_business_id = not args.no_by_business_id
     use_by_contact_domain = not args.no_by_contact_domain
 
     token = load_token()
@@ -213,11 +248,17 @@ def main():
     total = len(companies)
     no_domain_count = sum(1 for c in companies if not c["domain"])
     print(f"Fetched {total} companies (without domain: {no_domain_count}).")
-    print(f"Rules -> by_domain={use_by_domain}, by_name={use_by_name}, by_contact_domain={use_by_contact_domain}")
+    print(
+        f"Rules -> by_domain={use_by_domain}, "
+        f"by_name={use_by_name}, "
+        f"by_business_id={use_by_business_id}, "
+        f"by_contact_domain={use_by_contact_domain}"
+    )
 
-    # Grouping by domain and normalized name
+    # Grouping by domain, normalized name and business_id
     by_domain: dict[str, list[dict]] = defaultdict(list)
     by_name: dict[str, list[dict]] = defaultdict(list)
+    by_business_id: dict[str, list[dict]] = defaultdict(list)
     all_company_ids: list[str] = []
 
     for c in companies:
@@ -228,13 +269,17 @@ def main():
             nn = norm_name(c["name"])
             if nn:
                 by_name[nn].append(c)
+        if use_by_business_id:
+            bid = (c.get("business_id") or "").strip()
+            if bid:
+                by_business_id[bid].append(c)
 
     # Contact-derived domains for companies missing a domain only
     by_contact_domain: dict[str, list[dict]] = defaultdict(list)
     contact_domains: dict[str, str] = {}
     derived_count = 0
     if use_by_contact_domain:
-        print("Deriving contact-based domains (associations + contact emails) ...")
+        print("Deriving contact-based domains (associations + contact emails) .")
         ids_without_domain = {c["id"] for c in companies if not c["domain"]}
         contact_domains = derive_contact_domain_for_companies(
             s, all_company_ids, only_ids_without_domain=ids_without_domain
@@ -247,7 +292,7 @@ def main():
         print(f"Derived contact-domain for {derived_count} companies (non-freemail).")
 
     # Collect duplicate rows
-    dup_rows = []
+    dup_rows: list[list[str]] = []
 
     def add_grouping(group_dict, label: str):
         groups = 0
@@ -257,14 +302,27 @@ def main():
             if len(uniq) > 1:
                 groups += 1
                 for it in uniq.values():
-                    dup_rows.append([it["id"], it["domain"], it["name"], label, key])
+                    dup_rows.append(
+                        [
+                            it["id"],
+                            it["domain"],
+                            it["name"],
+                            (it.get("business_id") or "").strip(),
+                            label,
+                            key,
+                        ]
+                    )
         return groups, len(dup_rows) - rows_before
 
-    g_dom = g_name = g_cdom = r_dom = r_name = r_cdom = 0
+    g_dom = g_name = g_bid = g_cdom = 0
+    r_dom = r_name = r_bid = r_cdom = 0
+
     if use_by_domain:
         g_dom, r_dom = add_grouping(by_domain, "company_domain")
     if use_by_name:
         g_name, r_name = add_grouping(by_name, "company_name")
+    if use_by_business_id:
+        g_bid, r_bid = add_grouping(by_business_id, "business_id")
     if use_by_contact_domain:
         g_cdom, r_cdom = add_grouping(by_contact_domain, "contact_domain")
 
@@ -278,15 +336,31 @@ def main():
     out_path = os.path.join("data", f"duplicates_{ts}.csv")
     with open(out_path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f, delimiter=";")
-        w.writerow(["id", "domain", "name", "match_type", "match_key"])
-        for row in sorted(dup_rows, key=lambda r: (r[3], r[4], r[2], r[0])):
+        w.writerow(
+            ["id", "domain", "name", "business_id", "match_type", "match_key"]
+        )
+        for row in sorted(dup_rows, key=lambda r: (r[4], r[5], r[2], r[0])):
             w.writerow(row)
 
-    print(f"\n✅ Saved {len(dup_rows)} rows to {out_path}")
-    print(f"Groups found -> by_domain: {g_dom} (rows {r_dom}), by_name: {g_name} (rows {r_name}), contact_domain: {g_cdom} (rows {r_cdom})")
+    print(f"\nSaved {len(dup_rows)} rows to {out_path}")
+    print(
+        "Groups found -> "
+        f"by_domain: {g_dom} (rows {r_dom}), "
+        f"by_name: {g_name} (rows {r_name}), "
+        f"by_business_id: {g_bid} (rows {r_bid}), "
+        f"contact_domain: {g_cdom} (rows {r_cdom})"
+    )
     if use_by_contact_domain:
-        print("Note: contact_domain derived from associated contacts' emails (freemail domains ignored).")
-        print("Required token scopes: crm.objects.companies.read, crm.associations.read, crm.objects.contacts.read")
+        print(
+            "Note: contact_domain derived from associated contacts' emails "
+            "(freemail domains ignored)."
+        )
+        print(
+            "Required token scopes: "
+            "crm.objects.companies.read, crm.associations.read, "
+            "crm.objects.contacts.read"
+        )
+
 
 if __name__ == "__main__":
     main()
