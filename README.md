@@ -35,9 +35,9 @@ This script finds duplicates using reliable rules:
 - business_id (custom property)
 
 Options:
-  --no-by-domain *– disable domain-based matching (default: enabled)*
-  --no-by-name *– disable name-based matching (default: enabled)*
-  --no-by-contact-domain *– disable contact-domain matching (default: enabled)*
+  --no-by-domain *– disable domain-based matching (default: enabled)*  
+  --no-by-name *– disable name-based matching (default: enabled)*  
+  --no-by-contact-domain *– disable contact-domain matching (default: enabled)*  
 
 **Output file:**
 
