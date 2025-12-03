@@ -34,7 +34,7 @@ This script finds duplicates using reliable rules:
 - contact-derived email domain  
 - business_id (custom property)
 
-Options:
+Options:  
   --no-by-domain *– disable domain-based matching (default: enabled)*  
   --no-by-name *– disable name-based matching (default: enabled)*  
   --no-by-contact-domain *– disable contact-domain matching (default: enabled)*  
@@ -58,7 +58,7 @@ id;domain;name;business_id;match_type;match_key
 
 Takes the duplicate CSV from step 1 and performs safe merges.
 
-Option:
+Option:  
   --apply *- without --apply script makes dry run, and does not change anything in hubspot*
 
 ### Behaviors:
@@ -66,8 +66,7 @@ Option:
 - groups rows by `(match_type, match_key)`  
 - identifies canonical candidates using createdate  
 - performs merges when safe  
-- logs forward-reference conflicts into a file:
-- 
+- logs forward-reference conflicts into a file- 
 
 ```
 manual_review_YYYYMMDD-HHMMSS.csv
@@ -108,11 +107,11 @@ python merge_manual_review.py --file data/manual_review_*.csv --apply
 
 Run after deterministic + manual merges.
 
-Options:
-  --output, -o *- (optional) Output path; default: data/all_companies_<timestamp>.csv*
-  --include-merged-history *- (optional, default: false)*
-  --max-count *- (optional, default: None), max count of companies*
-  --limit *- (optional, default: 100), API page size = how many companies fetched per request*
+Options:  
+  --output, -o *- (optional) Output path; default: data/all_companies_<timestamp>.csv*  
+  --include-merged-history *- (optional, default: false)*  
+  --max-count *- (optional, default: None), max count of companies*  
+  --limit *- (optional, default: 100), API page size = how many companies fetched per request*  
 
 ### Example:
 
@@ -145,10 +144,10 @@ python company_duplicates_fuzzy.py \
   --max-bucket-size 200 \
   --max-pairs 200
 ```
-Defaults:
-  min-score 90
-  max-bucket-size 200
-  max-pairs no-limit
+Defaults:  
+  min-score 90  
+  max-bucket-size 200  
+  max-pairs no-limit  
 
 ### Output:
 
@@ -167,10 +166,10 @@ id1;id2;score;reason
 **Script:** `merge_fuzzy_ids.py`  
 Uses **merge_by_name.py** as a library — **never run merge_by_name.py directly**.
 
-Options:
-  --file *- (required) – fuzzy CSV path*
-  --max-clusters *- (optional, default: None) – limit how many clusters to process*
-  --apply *- (optional, default: dry run) – actually perform merges*
+Options:  
+  --file *- (required) – fuzzy CSV path*  
+  --max-clusters *- (optional, default: None) – limit how many clusters to process*  
+  --apply *- (optional, default: dry run) – actually perform merges*  
 
 ### Example:
 
