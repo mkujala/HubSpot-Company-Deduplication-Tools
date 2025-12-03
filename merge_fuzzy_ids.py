@@ -169,21 +169,51 @@ def merge_companies(
 
 
 # ----------------------------------------------------------------------
+# Interactive confirmation
+# ----------------------------------------------------------------------
+def prompt_merge_decision(
+    secondary_id: str,
+    primary_id: str,
+    secondary_name: str,
+    primary_name: str,
+) -> bool:
+    """
+    Ask user whether to attempt a merge for this pair.
+
+    Returns True if user answered yes, False otherwise.
+    """
+    while True:
+        choice = (
+            input(
+                f"    Merge {secondary_id} ({secondary_name}) into {primary_id} ({primary_name})? [y/n]: "
+            )
+            .strip()
+            .lower()
+        )
+        if choice in ("y", "n"):
+            return choice == "y"
+        print("    Please answer with 'y' or 'n'.")
+
+
+# ----------------------------------------------------------------------
 # Cluster processing
 # ----------------------------------------------------------------------
 def process_cluster(
     cluster_ids: Set[str],
     apply: bool,
     merged_pairs: List[Tuple[str, str, str, str]],
+    failed_pairs: List[Tuple[str, str, str, str, str]],
 ) -> None:
     """
     Process a single cluster of company IDs.
 
     - Fetch name + createdate for each ID
     - Choose initial primary as the oldest createdate
+    - Ask confirmation for each merge attempt (when apply=True)
     - Merge others into primary, handling forward references
     - On successful merge (in apply mode), append pair to merged_pairs
       as (secondary_id, primary_id, secondary_name, primary_name)
+    - On failure, append to failed_pairs with error message
     """
     ids = sorted(cluster_ids)
     print(f"\nCluster with {len(ids)} companies: {', '.join(ids)}")
@@ -212,13 +242,32 @@ def process_cluster(
             continue
 
         sec_name = info_map.get(cid, (f"Company {cid}", datetime.max))[0]
+
+        # Ask user whether to attempt merge when in apply mode
+        if apply:
+            should_merge = prompt_merge_decision(cid, primary, sec_name, primary_name)
+            if not should_merge:
+                print("    Skipping merge by user choice.")
+                continue
+
         print(f"  Merging {cid} ({sec_name}) -> {primary} ({primary_name})")
 
         ok, new_primary, info = merge_companies(primary, cid, apply)
         print(f"    RESULT: {info}")
 
         if not ok and info.startswith("forward_ref:"):
-            # Switch primary to canonical from error, retry once
+            # Case A: forward reference points to the same primary.
+            # This means the secondary already canonicalises to the current primary,
+            # so the merge is effectively a no-op but can be counted as success.
+            if new_primary == primary:
+                print(
+                    "    Forward reference points to the same primary; treating as already canonical / merged."
+                )
+                if apply:
+                    merged_pairs.append((cid, primary, sec_name, primary_name))
+                continue
+
+            # Case B: primary is not canonical; switch primary and retry once.
             print(
                 f"    Forward reference detected, switching primary to {new_primary} and retrying"
             )
@@ -234,19 +283,33 @@ def process_cluster(
 
             ok2, new_primary2, info2 = merge_companies(primary, cid, apply)
             print(f"      RETRY RESULT: {info2}")
+
+            # Retry still reports forward_ref to the same primary: treat as success.
+            if not ok2 and info2.startswith("forward_ref:") and new_primary2 == primary:
+                print(
+                    "      Forward reference for retry still points to the same primary; treating as already canonical / merged."
+                )
+                if apply:
+                    merged_pairs.append((cid, primary, sec_name, primary_name))
+                continue
+
             if ok2:
                 if apply:
-                    merged_pairs.append(
-                        (cid, primary, sec_name, primary_name)
-                    )
+                    merged_pairs.append((cid, primary, sec_name, primary_name))
                 primary = new_primary2
                 primary_name = info_map.get(
                     primary, (f"Company {primary}", datetime.max)
                 )[0]
+            else:
+                print("      Merge failed after primary switch.")
+                failed_pairs.append((cid, primary, sec_name, primary_name, info2))
         else:
-            # No forward reference; if merge succeeded and we are applying, record pair
-            if ok and apply:
-                merged_pairs.append((cid, primary, sec_name, primary_name))
+            # No forward reference; treat based on success flag
+            if ok:
+                if apply:
+                    merged_pairs.append((cid, primary, sec_name, primary_name))
+            else:
+                failed_pairs.append((cid, primary, sec_name, primary_name, info))
 
 
 # ----------------------------------------------------------------------
@@ -287,9 +350,15 @@ def main() -> None:
         print(f"Limiting to first {len(clusters)} clusters due to --max-clusters.")
 
     merged_pairs: List[Tuple[str, str, str, str]] = []
+    failed_pairs: List[Tuple[str, str, str, str, str]] = []
 
     for cluster in clusters:
-        process_cluster(cluster, apply=args.apply, merged_pairs=merged_pairs)
+        process_cluster(
+            cluster,
+            apply=args.apply,
+            merged_pairs=merged_pairs,
+            failed_pairs=failed_pairs,
+        )
 
     if args.apply:
         print("\nSummary of successful merges:")
@@ -298,6 +367,27 @@ def main() -> None:
         else:
             for sec_id, prim_id, sec_name, prim_name in merged_pairs:
                 print(f"  {sec_name} <-> {prim_name} ({sec_id} -> {prim_id})")
+
+        if failed_pairs:
+            failed_path = fuzzy_path.with_name(fuzzy_path.stem + "_failed.csv")
+            with failed_path.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f, delimiter=";")
+                writer.writerow(
+                    [
+                        "secondary_id",
+                        "primary_id",
+                        "secondary_name",
+                        "primary_name",
+                        "error",
+                    ]
+                )
+                for row in failed_pairs:
+                    writer.writerow(row)
+            print(
+                f"\nWrote CSV with unresolved/failed merges to: {failed_path}"
+            )
+        else:
+            print("\nNo failed merges, no failed CSV written.")
     else:
         print("\nDry run complete. No merges were applied. Use --apply to perform merges.")
 

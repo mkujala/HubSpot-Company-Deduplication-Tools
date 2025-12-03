@@ -34,6 +34,11 @@ This script finds duplicates using reliable rules:
 - contact-derived email domain  
 - business_id (custom property)
 
+Options:
+  --no-by-domain *– disable domain-based matching (default: enabled)*
+  --no-by-name *– disable name-based matching (default: enabled)*
+  --no-by-contact-domain *– disable contact-domain matching (default: enabled)*
+
 **Output file:**
 
 ```
@@ -53,12 +58,16 @@ id;domain;name;business_id;match_type;match_key
 
 Takes the duplicate CSV from step 1 and performs safe merges.
 
+Option:
+  --apply *- without --apply script makes dry run, and does not change anything in hubspot*
+
 ### Behaviors:
 
 - groups rows by `(match_type, match_key)`  
 - identifies canonical candidates using createdate  
 - performs merges when safe  
 - logs forward-reference conflicts into a file:
+- 
 
 ```
 manual_review_YYYYMMDD-HHMMSS.csv
@@ -99,6 +108,12 @@ python merge_manual_review.py --file data/manual_review_*.csv --apply
 
 Run after deterministic + manual merges.
 
+Options:
+  --output, -o *- (optional) Output path; default: data/all_companies_<timestamp>.csv*
+  --include-merged-history *- (optional, default: false)*
+  --max-count *- (optional, default: None), max count of companies*
+  --limit *- (optional, default: 100), API page size = how many companies fetched per request*
+
 ### Example:
 
 ```
@@ -120,15 +135,20 @@ all_companies_YYYYMMDD-HHMMSS.csv
 
 ```
 python company_duplicates_fuzzy.py --input data/all_companies_*.csv
-
+```
 all options:
-
+```
 python company_duplicates_fuzzy.py \
   --input data/all_companies_20251202-XXXXXX.csv \
-  --output data/company_duplicates_fuzzy_test.csv \
-  --min-score 88 \
-  --max-bucket-size 200
+  --output data/company_duplicates_fuzzy_test.csv \  
+  --min-score 90 \
+  --max-bucket-size 200 \
+  --max-pairs 200
 ```
+Defaults:
+  min-score 90
+  max-bucket-size 200
+  max-pairs no-limit
 
 ### Output:
 
@@ -146,6 +166,11 @@ id1;id2;score;reason
 ## 6. Fuzzy cluster merging  
 **Script:** `merge_fuzzy_ids.py`  
 Uses **merge_by_name.py** as a library — **never run merge_by_name.py directly**.
+
+Options:
+  --file *- (required) – fuzzy CSV path*
+  --max-clusters *- (optional, default: None) – limit how many clusters to process*
+  --apply *- (optional, default: dry run) – actually perform merges*
 
 ### Example:
 
